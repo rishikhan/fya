@@ -1,5 +1,8 @@
 version: 2
 
+release:
+  name_template: Version {{ .Version }}
+
 builds:
   - id: fya
     main: ./app
