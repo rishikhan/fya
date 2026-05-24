@@ -106,7 +106,7 @@ func (c *Catalog) Select(cwd string, since time.Time, prompt string) (Candidate,
 	if err != nil {
 		return Candidate{}, err
 	}
-	forms := promptForms(prompt)
+	forms := c.promptForms(prompt)
 	for _, candidate := range candidates {
 		if candidate.ModTime.Before(since) {
 			continue
@@ -114,7 +114,7 @@ func (c *Catalog) Select(cwd string, since time.Time, prompt string) (Candidate,
 		if prompt == "" {
 			return candidate, nil
 		}
-		matches, err := fileContainsAny(candidate.Path, forms)
+		matches, err := c.fileContainsAny(candidate.Path, forms)
 		if err != nil {
 			return Candidate{}, fmt.Errorf("scan transcript %s: %w", candidate.Path, err)
 		}
@@ -128,7 +128,7 @@ func (c *Catalog) Select(cwd string, since time.Time, prompt string) (Candidate,
 // promptForms returns the raw prompt plus its JSON-string-encoded form (minus
 // the surrounding quotes) so transcripts written with JSON escaping still match.
 // Duplicates (when the prompt has no characters needing escaping) are removed.
-func promptForms(prompt string) []string {
+func (*Catalog) promptForms(prompt string) []string {
 	if prompt == "" {
 		return nil
 	}
@@ -163,7 +163,7 @@ func encodeProjectPath(path string) string {
 // longest needle so a match split across a read boundary is not missed. Read
 // errors are surfaced rather than silently treated as "no match" — permission
 // errors or partial reads otherwise hide real problems.
-func fileContainsAny(path string, needles []string) (bool, error) {
+func (*Catalog) fileContainsAny(path string, needles []string) (bool, error) {
 	if len(needles) == 0 {
 		return false, nil
 	}

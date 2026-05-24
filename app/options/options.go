@@ -243,19 +243,19 @@ func (s *splitter) split() ([]string, []string, error) {
 }
 
 func (s *splitter) splitLong(i int) (int, error) {
-	name, hasValue := longName(s.args[i])
+	name, hasValue := s.longName(s.args[i])
 	switch {
-	case has(consumedBool, name):
+	case s.has(consumedBool, name):
 		return s.skipLongBool(name, hasValue, i)
-	case has(consumedValue, name):
+	case s.has(consumedValue, name):
 		return s.skipLongValue(name, hasValue, i)
-	case has(forwardBool, name):
+	case s.has(forwardBool, name):
 		return s.appendLongBool(name, hasValue, i)
-	case has(forwardValue, name):
+	case s.has(forwardValue, name):
 		return s.appendLongValue(name, hasValue, i)
-	case has(forwardOptionalValue, name):
+	case s.has(forwardOptionalValue, name):
 		return s.appendLongOptionalValue(hasValue, i)
-	case has(forwardVariadic, name):
+	case s.has(forwardVariadic, name):
 		return s.appendLongVariadic(name, hasValue, i)
 	default:
 		return 0, fmt.Errorf("unknown flag: --%s", name)
@@ -292,7 +292,7 @@ func (s *splitter) appendLongValue(name string, hasValue bool, i int) (int, erro
 		s.claude = append(s.claude, s.args[i])
 		return i, nil
 	}
-	if i+1 >= len(s.args) || isFlag(s.args[i+1]) {
+	if i+1 >= len(s.args) || s.isFlag(s.args[i+1]) {
 		return 0, fmt.Errorf("flag --%s requires a value", name)
 	}
 	s.claude = append(s.claude, s.args[i], s.args[i+1])
@@ -301,7 +301,7 @@ func (s *splitter) appendLongValue(name string, hasValue bool, i int) (int, erro
 
 func (s *splitter) appendLongOptionalValue(hasValue bool, i int) (int, error) {
 	s.claude = append(s.claude, s.args[i])
-	if hasValue || i+1 >= len(s.args) || isFlag(s.args[i+1]) {
+	if hasValue || i+1 >= len(s.args) || s.isFlag(s.args[i+1]) {
 		return i, nil
 	}
 	s.claude = append(s.claude, s.args[i+1])
@@ -313,11 +313,11 @@ func (s *splitter) appendLongVariadic(name string, hasValue bool, i int) (int, e
 		s.claude = append(s.claude, s.args[i])
 		return i, nil
 	}
-	if i+1 >= len(s.args) || isFlag(s.args[i+1]) {
+	if i+1 >= len(s.args) || s.isFlag(s.args[i+1]) {
 		return 0, fmt.Errorf("flag --%s requires a value", name)
 	}
 	s.claude = append(s.claude, s.args[i])
-	for i+1 < len(s.args) && !isFlag(s.args[i+1]) {
+	for i+1 < len(s.args) && !s.isFlag(s.args[i+1]) {
 		i++
 		s.claude = append(s.claude, s.args[i])
 	}
@@ -329,23 +329,19 @@ func (s *splitter) splitShort(i int) (int, error) {
 	switch arg {
 	case "-p", "-V", "-h":
 		return i, nil
-	case "-v":
-		// -v is Claude's verbose short flag — forward to claude rather than
-		// consume as a fya version banner.
-		s.claude = append(s.claude, arg)
-		return i, nil
-	case "-c":
+	case "-v", "-c":
+		// -v belongs to Claude, not fya version output; -c is Claude continue.
 		s.claude = append(s.claude, arg)
 		return i, nil
 	case "-d", "-r", "-w":
 		s.claude = append(s.claude, arg)
-		if i+1 >= len(s.args) || isFlag(s.args[i+1]) {
+		if i+1 >= len(s.args) || s.isFlag(s.args[i+1]) {
 			return i, nil
 		}
 		s.claude = append(s.claude, s.args[i+1])
 		return i + 1, nil
 	case "-n":
-		if i+1 >= len(s.args) || isFlag(s.args[i+1]) {
+		if i+1 >= len(s.args) || s.isFlag(s.args[i+1]) {
 			return 0, fmt.Errorf("flag %s requires a value", arg)
 		}
 		s.claude = append(s.claude, arg, s.args[i+1])
@@ -355,7 +351,7 @@ func (s *splitter) splitShort(i int) (int, error) {
 	}
 }
 
-func longName(arg string) (string, bool) {
+func (*splitter) longName(arg string) (string, bool) {
 	name := strings.TrimPrefix(arg, "--")
 	before, _, ok := strings.Cut(name, "=")
 	if ok {
@@ -364,11 +360,11 @@ func longName(arg string) (string, bool) {
 	return name, false
 }
 
-func isFlag(s string) bool {
+func (*splitter) isFlag(s string) bool {
 	return strings.HasPrefix(s, "-") && s != "-"
 }
 
-func has(names map[string]struct{}, name string) bool {
+func (*splitter) has(names map[string]struct{}, name string) bool {
 	_, ok := names[name]
 	return ok
 }

@@ -78,10 +78,11 @@ func main() {
 }
 
 func execute(parent context.Context, req request) error {
-	cfg, err := options.NewParser().Parse(req.Args)
+	parser := options.NewParser()
+	cfg, err := parser.Parse(req.Args)
 	if err != nil {
 		if errors.Is(err, options.ErrHelp) {
-			options.NewParser().WriteHelp(req.Stdout)
+			parser.WriteHelp(req.Stdout)
 			return nil
 		}
 		return fmt.Errorf("parse options: %w", err)

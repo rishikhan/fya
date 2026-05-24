@@ -33,8 +33,8 @@ func (p *parser) parse(line []byte) (Event, error) {
 		return Event{}, fmt.Errorf("parse transcript event: %w", err)
 	}
 	event := Event{
-		Type:      stringField(raw, "type"),
-		SessionID: stringField(raw, "sessionId"),
+		Type:      p.stringField(raw, "type"),
+		SessionID: p.stringField(raw, "sessionId"),
 	}
 	event.Text = p.extractText(event.Type, raw)
 	event.ToolUseIDs = p.toolIDs(raw, "tool_use")
@@ -54,7 +54,7 @@ func (p *parser) extractText(eventType string, raw map[string]any) string {
 		return text
 	}
 	if delta, ok := raw["delta"].(map[string]any); ok {
-		if text := stringField(delta, "text"); text != "" {
+		if text := p.stringField(delta, "text"); text != "" {
 			return text
 		}
 	}
@@ -68,12 +68,8 @@ func (p *parser) isAssistant(eventType string, raw map[string]any) bool {
 	if eventType == "assistant" {
 		return true
 	}
-	if msg, ok := raw["message"].(map[string]any); ok {
-		if stringField(msg, "role") == "assistant" {
-			return true
-		}
-	}
-	return false
+	msg, ok := raw["message"].(map[string]any)
+	return ok && p.stringField(msg, "role") == "assistant"
 }
 
 func (p *parser) toolIDs(raw map[string]any, blockType string) []string {
@@ -92,14 +88,14 @@ func (p *parser) collectToolIDs(content any, blockType string, ids *[]string) {
 	}
 	for _, item := range items {
 		block, ok := item.(map[string]any)
-		if !ok || stringField(block, "type") != blockType {
+		if !ok || p.stringField(block, "type") != blockType {
 			continue
 		}
-		if id := stringField(block, "id"); id != "" {
+		if id := p.stringField(block, "id"); id != "" {
 			*ids = append(*ids, id)
 			continue
 		}
-		if id := stringField(block, "tool_use_id"); id != "" {
+		if id := p.stringField(block, "tool_use_id"); id != "" {
 			*ids = append(*ids, id)
 		}
 	}
@@ -116,7 +112,7 @@ func (p *parser) contentText(content any) string {
 			if !ok {
 				continue
 			}
-			if text := stringField(block, "text"); text != "" {
+			if text := p.stringField(block, "text"); text != "" {
 				out.WriteString(text)
 			}
 		}
@@ -161,7 +157,7 @@ func (t *Tracker) pendingCount() int {
 	return len(t.pending)
 }
 
-func stringField(raw map[string]any, name string) string {
+func (*parser) stringField(raw map[string]any, name string) string {
 	value, _ := raw[name].(string)
 	return value
 }
