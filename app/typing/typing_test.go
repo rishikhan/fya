@@ -58,6 +58,95 @@ func TestTypeMultilinePrompt(t *testing.T) {
 	assert.Equal(t, "a\x1b\rb\r", out.String())
 }
 
+func TestTypePasteAboveThreshold(t *testing.T) {
+	sleep := &fakeSleeper{}
+	var out bytes.Buffer
+
+	err := NewInjector(Config{MaxWPMSize: 2, SettleDelay: time.Millisecond, Sleeper: sleep.sleep}).Type(t.Context(), &out, "one two three")
+
+	require.NoError(t, err)
+	assert.Equal(t, "one two three\r", out.String())
+	assert.Len(t, sleep.delays, 1, "paste mode uses only the settle delay, no per-rune sleeps")
+}
+
+func TestTypePasteMultiline(t *testing.T) {
+	sleep := &fakeSleeper{}
+	var out bytes.Buffer
+
+	err := NewInjector(Config{MaxWPMSize: 1, Sleeper: sleep.sleep}).Type(t.Context(), &out, "a\nbc")
+
+	require.NoError(t, err)
+	assert.Equal(t, "a\x1b\rbc\r", out.String(), "internal newline stays ESC+CR so the paste is one message")
+	assert.Len(t, sleep.delays, 1, "single settle delay proves the paste path, not rune-by-rune typing")
+}
+
+func TestTypePasteAtThresholdStillTypes(t *testing.T) {
+	sleep := &fakeSleeper{}
+	var out bytes.Buffer
+
+	err := NewInjector(Config{WPM: 100, Jitter: -1, MaxWPMSize: 2, SettleDelay: time.Millisecond, Sleeper: sleep.sleep}).
+		Type(t.Context(), &out, "a b")
+
+	require.NoError(t, err)
+	assert.Equal(t, "a b\r", out.String())
+	assert.Len(t, sleep.delays, 4, "word count equal to threshold still types rune-by-rune (3 runes + settle)")
+}
+
+func TestTypePasteDisabledByDefault(t *testing.T) {
+	sleep := &fakeSleeper{}
+	var out bytes.Buffer
+
+	err := NewInjector(Config{WPM: 100, Jitter: -1, SettleDelay: time.Millisecond, Sleeper: sleep.sleep}).Type(t.Context(), &out, "a b c d")
+
+	require.NoError(t, err)
+	assert.Len(t, sleep.delays, 8, "MaxWPMSize=0 disables paste, all runes typed (7 runes + settle)")
+}
+
+func TestTypePasteSkipsTurnTimeoutGuard(t *testing.T) {
+	var out bytes.Buffer
+
+	err := NewInjector(Config{MaxWPMSize: 1, TurnTimeout: time.Nanosecond, Sleeper: (&fakeSleeper{}).sleep}).
+		Type(t.Context(), &out, "a long prompt that would exceed any tiny typing budget")
+
+	require.NoError(t, err, "paste mode must not hit the estimated-typing-duration turn-timeout guard")
+}
+
+func TestTypePasteWriteError(t *testing.T) {
+	w := &errWriter{failAfter: 0}
+
+	err := NewInjector(Config{MaxWPMSize: 1, Sleeper: (&fakeSleeper{}).sleep}).Type(t.Context(), w, "a b c")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "paste prompt")
+}
+
+func TestTypePasteSubmitWriteError(t *testing.T) {
+	w := &errWriter{failAfter: 1}
+
+	err := NewInjector(Config{MaxWPMSize: 1, Sleeper: (&fakeSleeper{}).sleep}).Type(t.Context(), w, "a b c")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "submit prompt")
+}
+
+func TestTypePasteSettleCancellation(t *testing.T) {
+	err := NewInjector(Config{MaxWPMSize: 1, Sleeper: cancelSleep}).Type(t.Context(), &bytes.Buffer{}, "a b c")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "settle delay")
+}
+
+func TestNewInjectorNegativeMaxWPMSizeDisablesPaste(t *testing.T) {
+	sleep := &fakeSleeper{}
+	var out bytes.Buffer
+
+	err := NewInjector(Config{WPM: 100, Jitter: -1, MaxWPMSize: -1, SettleDelay: time.Millisecond, Sleeper: sleep.sleep}).
+		Type(t.Context(), &out, "a b c")
+
+	require.NoError(t, err)
+	assert.Len(t, sleep.delays, 6, "negative MaxWPMSize clamps to 0 (paste disabled), so all runes type (5 runes + settle)")
+}
+
 func TestJitterBounds(t *testing.T) {
 	jitter := &sequenceJitter{values: []float64{0, 1, 0.5}}
 	injector := NewInjector(Config{
