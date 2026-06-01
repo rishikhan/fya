@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.2 - 2026-05-31
+
+### Bug Fixes
+
+- Fix stream-json Ralphex compatibility.
+
 ## v0.2.1 - 2026-05-30
 
 ### Bug Fixes
