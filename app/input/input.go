@@ -14,8 +14,9 @@ import (
 var ErrEmptyPrompt = errors.New("prompt is required")
 
 // newlineNormalizer collapses internal CRLF and lone CR to LF so the resolved
-// prompt carries only LF newlines. The downstream typing/paste paths translate
-// LF to an ESC+CR multiline insert; a bare CR would instead read as Enter and
+// prompt carries only LF newlines. Downstream, typed mode translates each LF to
+// an ESC+CR multiline insert and paste mode wraps the whole body in
+// bracketed-paste markers; either way a bare CR would instead read as Enter and
 // submit the prompt early. The same normalized prompt is later matched against
 // the Claude transcript, so normalizing once here keeps injection and transcript
 // selection consistent.
