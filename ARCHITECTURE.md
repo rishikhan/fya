@@ -67,6 +67,7 @@ Consumed by `fya`:
 - `--replay-user-messages`
 - `--idle-timeout`
 - `--turn-timeout`
+- `--gate`
 - `--cwd`
 - `--typing-wpm`
 - `--typing-jitter`
@@ -195,6 +196,8 @@ runeCount(prompt) * baseDelay + settleDelay
 
 If estimated typing time exceeds `--turn-timeout`, it fails before launching the prompt into Claude. If the estimate exceeds the warning threshold, currently 30 seconds, fya writes a warning to stderr.
 
+`--gate` is a wrapper-only profile for unattended gate or cron runs. It does not change completion semantics; it only changes the default turn timeout from `30m` to `5m` when `--turn-timeout` was not supplied. Explicit `--turn-timeout` always wins, and values after `--` are prompt text.
+
 ## Transcript Discovery
 
 Claude Code writes JSONL transcripts under:
@@ -229,6 +232,8 @@ Transcript selection:
 
 Offsets advance only past complete newline-terminated lines. A partial trailing line is not consumed, so a poll that catches Claude mid-write can re-read the completed line on the next poll.
 
+The tailer also tracks transcript file-size activity. Activity is true on the first read and whenever the file size changes, including partial trailing JSONL and ignored metadata records that do not become output. The runner resets idle completion timing on parsed events or file activity, so idle completion waits for transcript file stability rather than parsed assistant events alone.
+
 The parser emits `transcript.Event` values with:
 
 - assistant text suitable for text/json output
@@ -245,9 +250,11 @@ Initial user prompts and result summaries do not produce assistant text.
 Completion is true when:
 
 - a transcript `result` event or `system`/`turn_duration` record appears, or
-- assistant text has appeared, no tool calls are pending, no `tool_use` stop reason is waiting for a later `end_turn`, and transcript output has been idle for `--idle-timeout`
+- completion-eligible assistant text has appeared, no tool calls are pending, no tool turn is waiting for a later assistant answer, and transcript output has been idle for `--idle-timeout`
 
-If Claude exits before a result event, fya drains the tailer a few more times to catch final transcript writes that landed near process exit. If a result appears during this drain, completion is normal. If not, fya emits an error final result and returns an error.
+Assistant text is completion-eligible only when it is not part of a tool-use event. This lets fya finish when Claude writes a post-tool final answer but omits `stop_reason: "end_turn"`, without finishing immediately after the `tool_result` alone.
+
+If Claude exits before a result event, fya drains the tailer a few more times to catch final transcript writes that landed near process exit. If drained events contain a terminal record or completion-eligible final assistant text, completion is normal. If not, fya emits an error final result and returns an error.
 
 ## Output Contract
 
