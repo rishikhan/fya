@@ -19,6 +19,14 @@ const (
 	defaultCharsPerWord  = 5
 	newlineWithoutSubmit = "\x1b\r"
 	submitEnter          = "\r"
+	// bracketed-paste control sequences. Wrapping the prompt in these makes the
+	// terminal/TUI treat the entire body — embedded newlines included — as a
+	// single literal paste, so Claude's TUI never interprets an embedded newline
+	// as a submit. This replaces the fragile ESC+CR ("\x1b\r") newline trick,
+	// which Claude's TUI intermittently parsed as ESC (standalone) + CR (submit),
+	// fragmenting one multi-line prompt into many message submissions.
+	bracketedPasteStart = "\x1b[200~"
+	bracketedPasteEnd    = "\x1b[201~"
 )
 
 // SleepFunc waits for d or until ctx is canceled; the real implementation uses
@@ -126,13 +134,15 @@ func (i *Injector) pasteMode(prompt string) bool {
 }
 
 // paste writes the whole prompt in a single write without per-rune pacing,
-// mirroring a terminal clipboard paste. Internal newlines emit ESC+CR so the
-// prompt stays one Claude message, then a settle delay and final submit. The
+// mirroring a terminal clipboard paste. The prompt — embedded LF newlines and
+// all — is wrapped in bracketed-paste markers so the TUI buffers it as one
+// literal block and never treats an embedded newline as a submit; a separate
+// carriage return after a settle delay submits the assembled message. The
 // typing-duration estimate and warning are skipped because pasting is
 // effectively instant. The prompt is expected to carry only LF newlines;
 // callers via the CLI get this from input's newline normalization.
 func (i *Injector) paste(ctx context.Context, w io.Writer, prompt string) error {
-	body := strings.ReplaceAll(prompt, "\n", newlineWithoutSubmit)
+	body := bracketedPasteStart + prompt + bracketedPasteEnd
 	if _, err := io.WriteString(w, body); err != nil {
 		return fmt.Errorf("paste prompt: %w", err)
 	}

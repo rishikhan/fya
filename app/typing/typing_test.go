@@ -65,7 +65,7 @@ func TestTypePasteAboveThreshold(t *testing.T) {
 	err := NewInjector(Config{MaxWPMSize: 2, SettleDelay: time.Millisecond, Sleeper: sleep.sleep}).Type(t.Context(), &out, "one two three")
 
 	require.NoError(t, err)
-	assert.Equal(t, "one two three\r", out.String())
+	assert.Equal(t, "\x1b[200~one two three\x1b[201~\r", out.String(), "paste is wrapped in bracketed-paste markers then submitted")
 	assert.Len(t, sleep.delays, 1, "paste mode uses only the settle delay, no per-rune sleeps")
 }
 
@@ -76,7 +76,7 @@ func TestTypePasteMultiline(t *testing.T) {
 	err := NewInjector(Config{MaxWPMSize: 1, Sleeper: sleep.sleep}).Type(t.Context(), &out, "a\nbc")
 
 	require.NoError(t, err)
-	assert.Equal(t, "a\x1b\rbc\r", out.String(), "internal newline stays ESC+CR so the paste is one message")
+	assert.Equal(t, "\x1b[200~a\nbc\x1b[201~\r", out.String(), "internal newline stays literal inside the bracketed paste so the prompt is one message")
 	assert.Len(t, sleep.delays, 1, "single settle delay proves the paste path, not rune-by-rune typing")
 }
 
