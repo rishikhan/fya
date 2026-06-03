@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"github.com/umputun/fya/app/input"
 	"github.com/umputun/fya/app/options"
 	"github.com/umputun/fya/app/ready"
+	"github.com/umputun/fya/app/schemaoutput"
 	"github.com/umputun/fya/app/stream"
 	"github.com/umputun/fya/app/transcript"
 	"github.com/umputun/fya/app/turn"
@@ -29,30 +31,46 @@ type turnExecutor interface {
 	Run(context.Context, turn.Config) error
 }
 
-type turnRunnerFactory func(stdout, stderr io.Writer, cfg options.Config) turnExecutor
+type turnRunnerFactory func(turnRunnerRequest) turnExecutor
 
-func defaultTurnRunner(stdout, stderr io.Writer, cfg options.Config) turnExecutor {
-	output := stream.NewWriter(stdout, stream.Config{Format: cfg.OutputFormat})
+type turnRunnerRequest struct {
+	Stdout                   io.Writer
+	Stderr                   io.Writer
+	Options                  options.Config
+	ValidateStructuredOutput func(string) (json.RawMessage, error)
+}
+
+func defaultTurnRunner(req turnRunnerRequest) turnExecutor {
+	cfg := req.Options
+	output := stream.NewWriter(req.Stdout, stream.Config{
+		Format:                   cfg.OutputFormat,
+		ValidateStructuredOutput: req.ValidateStructuredOutput,
+	})
 	return turn.NewRunner(turn.Dependencies{
 		ProcessStarter: turn.NewPTYStarter(),
 		Readiness: ready.NewDetector(ready.Config{
 			Timeout:         cfg.ReadinessTimeout,
-			Warn:            stderr,
+			Warn:            req.Stderr,
 			NonFatalTimeout: true,
 		}),
-		Injector: typing.NewInjector(typing.Config{
-			WPM:         cfg.TypingWPM,
-			Jitter:      cfg.TypingJitter,
-			MaxWPMSize:  cfg.MaxWPMSize,
-			TurnTimeout: cfg.TurnTimeout,
-			Warn:        stderr,
-		}),
-		Catalog: transcript.NewCatalog(os.Getenv("FYA_CLAUDE_DIR")),
+		Injector: typing.NewInjector(typingConfig(cfg, req.Stderr)),
+		Catalog:  transcript.NewCatalog(os.Getenv("FYA_CLAUDE_DIR")),
 		TailerFactory: func(path string) turn.Tailer {
 			return transcript.NewTailer(path)
 		},
 		Output: output,
 	})
+}
+
+func typingConfig(cfg options.Config, warn io.Writer) typing.Config {
+	return typing.Config{
+		WPM:         cfg.TypingWPM,
+		Jitter:      cfg.TypingJitter,
+		MaxWPMSize:  cfg.MaxWPMSize,
+		ForcePaste:  cfg.JSONSchema != "",
+		TurnTimeout: cfg.TurnTimeout,
+		Warn:        warn,
+	}
 }
 
 // request groups the per-invocation inputs to execute/run.
@@ -127,7 +145,23 @@ func run(ctx context.Context, cfg options.Config, req request) error {
 		return fmt.Errorf("read prompt: %w", err)
 	}
 
-	if err := req.Factory(req.Stdout, req.Stderr, cfg).Run(ctx, turn.Config{
+	var validateStructuredOutput func(string) (json.RawMessage, error)
+	if cfg.JSONSchema != "" {
+		var err error
+		validateStructuredOutput, err = schemaoutput.NewValidator(cfg.JSONSchema)
+		if err != nil {
+			return fmt.Errorf("prepare structured output: %w", err)
+		}
+		prompt += schemaoutput.Instruction(cfg.JSONSchema)
+	}
+
+	runnerReq := turnRunnerRequest{
+		Stdout:                   req.Stdout,
+		Stderr:                   req.Stderr,
+		Options:                  cfg,
+		ValidateStructuredOutput: validateStructuredOutput,
+	}
+	if err := req.Factory(runnerReq).Run(ctx, turn.Config{
 		ClaudeArgs:   cfg.ClaudeArgs,
 		CWD:          cfg.CWD,
 		TurnTimeout:  cfg.TurnTimeout,

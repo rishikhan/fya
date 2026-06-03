@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/umputun/fya/app/options"
+	"github.com/umputun/fya/app/schemaoutput"
 	"github.com/umputun/fya/app/turn"
 )
 
@@ -25,7 +27,9 @@ func TestRevisionDefault(t *testing.T) {
 func TestExecuteVersion(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	err := execute(t.Context(), testRequest([]string{"--version"}, &stdout, &stderr, neverFactory(t)))
+	err := execute(t.Context(), testRequest(testReq{
+		args: []string{"--version"}, stdout: &stdout, stderr: &stderr, factory: neverFactory(t),
+	}))
 
 	require.NoError(t, err)
 	assert.Contains(t, stdout.String(), "fya test-rev")
@@ -36,15 +40,26 @@ func TestExecuteVersion(t *testing.T) {
 func TestDefaultTurnRunner(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	runner := defaultTurnRunner(&stdout, &stderr, options.Config{})
+	runner := defaultTurnRunner(turnRunnerRequest{Stdout: &stdout, Stderr: &stderr, Options: options.Config{}})
 
 	assert.NotNil(t, runner)
+}
+
+func TestTypingConfigForcesPasteWithJSONSchema(t *testing.T) {
+	cfg := options.Config{JSONSchema: `{"type":"object"}`, MaxWPMSize: 0}
+
+	got := typingConfig(cfg, io.Discard)
+
+	assert.True(t, got.ForcePaste)
+	assert.Equal(t, 0, got.MaxWPMSize)
 }
 
 func TestExecuteMissingPrompt(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	err := execute(t.Context(), testRequest([]string{"--print"}, &stdout, &stderr, neverFactory(t)))
+	err := execute(t.Context(), testRequest(testReq{
+		args: []string{"--print"}, stdout: &stdout, stderr: &stderr, factory: neverFactory(t),
+	}))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "prompt is required")
@@ -53,7 +68,9 @@ func TestExecuteMissingPrompt(t *testing.T) {
 func TestExecuteHelp(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	err := execute(t.Context(), testRequest([]string{"--help"}, &stdout, &stderr, neverFactory(t)))
+	err := execute(t.Context(), testRequest(testReq{
+		args: []string{"--help"}, stdout: &stdout, stderr: &stderr, factory: neverFactory(t),
+	}))
 
 	require.NoError(t, err)
 	assert.Contains(t, stdout.String(), "Usage:")
@@ -66,7 +83,7 @@ func TestRunEnablesStreamEventsForStreamJSON(t *testing.T) {
 	cfg := optionsConfig("hello")
 	cfg.OutputFormat = "stream-json"
 
-	err := run(t.Context(), cfg, testRequest(nil, &stdout, &stderr, captureConfigFactory(&got)))
+	err := run(t.Context(), cfg, testRequest(testReq{stdout: &stdout, stderr: &stderr, factory: captureConfigFactory(&got)}))
 
 	require.NoError(t, err)
 	assert.True(t, got.StreamEvents)
@@ -79,7 +96,7 @@ func TestRunSilentKeepsStreamEvents(t *testing.T) {
 	cfg.OutputFormat = "stream-json"
 	cfg.Silent = true
 
-	err := run(t.Context(), cfg, testRequest(nil, &stdout, &stderr, captureConfigFactory(&got)))
+	err := run(t.Context(), cfg, testRequest(testReq{stdout: &stdout, stderr: &stderr, factory: captureConfigFactory(&got)}))
 
 	require.NoError(t, err)
 	assert.True(t, got.StreamEvents)
@@ -88,20 +105,98 @@ func TestRunSilentKeepsStreamEvents(t *testing.T) {
 func TestRunPropagatesTurnError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	err := run(t.Context(), optionsConfig("hello"), testRequest(nil, &stdout, &stderr, factoryReturning(errors.New("turn failed"))))
+	err := run(t.Context(), optionsConfig("hello"), testRequest(testReq{
+		stdout: &stdout, stderr: &stderr, factory: factoryReturning(errors.New("turn failed")),
+	}))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "turn failed")
 }
 
+func TestRunAppendsJSONSchemaInstruction(t *testing.T) {
+	var gotPrompt string
+	var stdout, stderr bytes.Buffer
+	schema := `{"type":"object","required":["summary"],"properties":{"summary":{"type":"string"}}}`
+	cfg := optionsConfig("hello")
+	cfg.OutputFormat = "json"
+	cfg.JSONSchema = schema
+
+	err := run(t.Context(), cfg, testRequest(testReq{stdout: &stdout, stderr: &stderr, factory: capturePromptFactory(&gotPrompt)}))
+
+	require.NoError(t, err)
+	assert.Equal(t, "hello"+schemaoutput.Instruction(schema), gotPrompt)
+}
+
+func TestRunPassesJSONSchemaValidatorToRunnerRequest(t *testing.T) {
+	var got func(string) (json.RawMessage, error)
+	var stdout, stderr bytes.Buffer
+	schema := `{"type":"object","required":["summary"],"properties":{"summary":{"type":"string"}}}`
+	cfg := optionsConfig("hello")
+	cfg.OutputFormat = "json"
+	cfg.JSONSchema = schema
+	factory := func(req turnRunnerRequest) turnExecutor {
+		got = req.ValidateStructuredOutput
+		return turnRunnerFunc(func(context.Context, turn.Config) error { return nil })
+	}
+
+	err := run(t.Context(), cfg, testRequest(testReq{stdout: &stdout, stderr: &stderr, factory: factory}))
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	raw, err := got(`{"summary":"done"}`)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"summary":"done"}`, string(raw))
+}
+
+func TestRunKeepsPromptUnchangedWithoutJSONSchema(t *testing.T) {
+	var gotPrompt string
+	var stdout, stderr bytes.Buffer
+
+	err := run(t.Context(), optionsConfig("hello"), testRequest(testReq{
+		stdout: &stdout, stderr: &stderr, factory: capturePromptFactory(&gotPrompt),
+	}))
+
+	require.NoError(t, err)
+	assert.Equal(t, "hello", gotPrompt)
+}
+
+func TestRunLeavesStructuredValidatorUnsetWithoutJSONSchema(t *testing.T) {
+	var got func(string) (json.RawMessage, error)
+	var stdout, stderr bytes.Buffer
+	cfg := optionsConfig("hello")
+	cfg.OutputFormat = "json"
+	factory := func(req turnRunnerRequest) turnExecutor {
+		got = req.ValidateStructuredOutput
+		return turnRunnerFunc(func(context.Context, turn.Config) error { return nil })
+	}
+
+	err := run(t.Context(), cfg, testRequest(testReq{stdout: &stdout, stderr: &stderr, factory: factory}))
+
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+func TestRunRejectsInvalidJSONSchemaBeforeTurn(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	cfg := optionsConfig("hello")
+	cfg.OutputFormat = "json"
+	cfg.JSONSchema = `{"type":"not-a-json-schema-type"}`
+
+	err := run(t.Context(), cfg, testRequest(testReq{stdout: &stdout, stderr: &stderr, factory: neverFactory(t)}))
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "prepare structured output")
+}
+
 func TestExecuteForwardsClaudeArgs(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	err := execute(t.Context(), testRequest(
-		[]string{"--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose", "--print", "hello"},
-		&stdout, &stderr,
-		factoryReturning(errors.New("turn failed")),
-	))
+	err := execute(t.Context(), testRequest(testReq{
+		args:    []string{"--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose", "--print", "hello"},
+		stdout:  &stdout,
+		stderr:  &stderr,
+		factory: factoryReturning(errors.New("turn failed")),
+	}))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "turn failed")
@@ -110,7 +205,9 @@ func TestExecuteForwardsClaudeArgs(t *testing.T) {
 func TestExecutePromptReturnsTurnError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	err := execute(t.Context(), testRequest([]string{"--print", "hello"}, &stdout, &stderr, factoryReturning(errors.New("turn failed"))))
+	err := execute(t.Context(), testRequest(testReq{
+		args: []string{"--print", "hello"}, stdout: &stdout, stderr: &stderr, factory: factoryReturning(errors.New("turn failed")),
+	}))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "turn failed")
@@ -120,7 +217,9 @@ func TestExecutePromptReturnsTurnError(t *testing.T) {
 func TestExecuteDoesNotWriteBannerForSuccessfulRun(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	err := execute(t.Context(), testRequest([]string{"--print", "hello"}, &stdout, &stderr, factoryReturning(nil)))
+	err := execute(t.Context(), testRequest(testReq{
+		args: []string{"--print", "hello"}, stdout: &stdout, stderr: &stderr, factory: factoryReturning(nil),
+	}))
 
 	require.NoError(t, err)
 	assert.Empty(t, stdout.String(), "clean stdout for runner output only")
@@ -154,7 +253,9 @@ func TestRunPositionalPromptDoesNotBlockOnOpenStdin(t *testing.T) {
 func TestExecuteInvalidFlag(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	err := execute(t.Context(), testRequest([]string{"--bad-flag"}, &stdout, &stderr, neverFactory(t)))
+	err := execute(t.Context(), testRequest(testReq{
+		args: []string{"--bad-flag"}, stdout: &stdout, stderr: &stderr, factory: neverFactory(t),
+	}))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown flag")
@@ -235,26 +336,33 @@ func optionsConfig(args ...string) options.Config {
 	return options.Config{PromptArgs: args}
 }
 
+type testReq struct {
+	args    []string
+	stdout  io.Writer
+	stderr  io.Writer
+	factory turnRunnerFactory
+}
+
 // testRequest builds a request with a fixed Rev so tests don't have to repeat it.
-func testRequest(args []string, stdout, stderr io.Writer, factory turnRunnerFactory) request {
+func testRequest(req testReq) request {
 	return request{
-		Args:    args,
+		Args:    req.args,
 		Stdin:   bytes.NewReader(nil),
-		Stdout:  stdout,
-		Stderr:  stderr,
+		Stdout:  req.stdout,
+		Stderr:  req.stderr,
 		Rev:     "test-rev",
-		Factory: factory,
+		Factory: req.factory,
 	}
 }
 
 func factoryReturning(err error) turnRunnerFactory {
-	return func(io.Writer, io.Writer, options.Config) turnExecutor {
+	return func(turnRunnerRequest) turnExecutor {
 		return turnRunnerFunc(func(context.Context, turn.Config) error { return err })
 	}
 }
 
 func capturePromptFactory(prompt *string) turnRunnerFactory {
-	return func(io.Writer, io.Writer, options.Config) turnExecutor {
+	return func(turnRunnerRequest) turnExecutor {
 		return turnRunnerFunc(func(_ context.Context, cfg turn.Config) error {
 			*prompt = cfg.Prompt
 			return nil
@@ -263,7 +371,7 @@ func capturePromptFactory(prompt *string) turnRunnerFactory {
 }
 
 func captureConfigFactory(got *turn.Config) turnRunnerFactory {
-	return func(io.Writer, io.Writer, options.Config) turnExecutor {
+	return func(turnRunnerRequest) turnExecutor {
 		return turnRunnerFunc(func(_ context.Context, cfg turn.Config) error {
 			*got = cfg
 			return nil
@@ -276,7 +384,7 @@ func captureConfigFactory(got *turn.Config) turnRunnerFactory {
 // must short-circuit before reaching the turn runner.
 func neverFactory(t *testing.T) turnRunnerFactory {
 	t.Helper()
-	return func(io.Writer, io.Writer, options.Config) turnExecutor {
+	return func(turnRunnerRequest) turnExecutor {
 		t.Fatal("turn runner factory invoked unexpectedly")
 		return nil
 	}
