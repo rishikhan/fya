@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.0 - 2026-06-03
+
+### New Features
+
+- Add `--json-schema` support for JSON output, with fya-owned schema validation and top-level `structured_output` envelope.
+
 ## v0.2.5 - 2026-06-03
 
 ### Bug Fixes
