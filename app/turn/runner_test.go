@@ -1153,6 +1153,334 @@ func assertTurnTimeoutFinal(t *testing.T, err error, output *mocks.OutputMock) {
 	assert.Contains(t, output.FinalCalls()[0].Result.Result, "FYA_TRANSIENT_TIMEOUT")
 }
 
+func TestRunnerNoActivityTimeout(t *testing.T) {
+	output := &mocks.OutputMock{
+		TextFunc:  func(string) error { return nil },
+		FinalFunc: func(stream.Result) error { return nil },
+	}
+	calls := 0
+	runner := turn.NewRunner(turn.Dependencies{
+		ProcessStarter: &mocks.ProcessStarterMock{StartFunc: func(context.Context, ptyrun.Config) (turn.Session, error) {
+			return newSessionMock(), nil
+		}},
+		Readiness: &mocks.ReadinessMock{WaitFunc: func(context.Context, ready.Source) (ready.Result, error) {
+			return ready.Result{Ready: true}, nil
+		}},
+		Injector: &mocks.InjectorMock{TypeFunc: func(context.Context, io.Writer, string) error { return nil }},
+		Catalog: &mocks.CatalogMock{SelectFunc: func(string, time.Time, string) (string, error) {
+			return "x.jsonl", nil
+		}},
+		TailerFactory: func(string) turn.Tailer {
+			return &mocks.TailerMock{ReadNewFunc: func() ([]transcript.Event, bool, error) {
+				calls++
+				if calls == 1 {
+					// pending tool keeps the turn non-completable, so only the no-activity stall can end it
+					return []transcript.Event{{ToolUseIDs: []string{"t1"}, StopReason: "tool_use", SessionID: "s9"}}, true, nil
+				}
+				return nil, false, nil
+			}}
+		},
+		Output: output,
+	})
+
+	err := runner.Run(t.Context(), turn.Config{
+		CWD: ".", TurnTimeout: time.Minute, IdleTimeout: time.Minute, NoActivityTimeout: 20 * time.Millisecond,
+		Prompt:     "hi",
+		PollPeriod: 5 * time.Millisecond,
+	})
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, turn.ErrNoActivityTimeout)
+	require.Len(t, output.FinalCalls(), 1)
+	result := output.FinalCalls()[0].Result
+	assert.True(t, result.IsError)
+	assert.Equal(t, "fya_no_activity_timeout", result.TerminalReason)
+	assert.Contains(t, result.Result, "FYA_TRANSIENT_TIMEOUT")
+	assert.Equal(t, "s9", result.SessionID)
+}
+
+func TestRunnerNoActivityTimeoutHeldOffWhileActive(t *testing.T) {
+	output := &mocks.OutputMock{
+		TextFunc:  func(string) error { return nil },
+		FinalFunc: func(stream.Result) error { return nil },
+	}
+	const (
+		noActivity   = 40 * time.Millisecond
+		activeWindow = 80 * time.Millisecond
+	)
+	calls := 0
+	start := time.Now()
+	runner := turn.NewRunner(turn.Dependencies{
+		ProcessStarter: &mocks.ProcessStarterMock{StartFunc: func(context.Context, ptyrun.Config) (turn.Session, error) {
+			return newSessionMock(), nil
+		}},
+		Readiness: &mocks.ReadinessMock{WaitFunc: func(context.Context, ready.Source) (ready.Result, error) {
+			return ready.Result{Ready: true}, nil
+		}},
+		Injector: &mocks.InjectorMock{TypeFunc: func(context.Context, io.Writer, string) error { return nil }},
+		Catalog: &mocks.CatalogMock{SelectFunc: func(string, time.Time, string) (string, error) {
+			return "x.jsonl", nil
+		}},
+		TailerFactory: func(string) turn.Tailer {
+			return &mocks.TailerMock{ReadNewFunc: func() ([]transcript.Event, bool, error) {
+				calls++
+				switch {
+				case calls == 1:
+					// pending tool keeps the turn non-completable, so the no-activity branch stays reachable
+					return []transcript.Event{{ToolUseIDs: []string{"t1"}, StopReason: "tool_use", SessionID: "s2"}}, true, nil
+				case time.Since(start) < activeWindow:
+					// activity every poll must reset the no-activity clock; a broken reset fires within activeWindow
+					return nil, true, nil
+				default:
+					return []transcript.Event{{Result: true, SessionID: "s2"}}, true, nil
+				}
+			}}
+		},
+		Output: output,
+	})
+
+	err := runner.Run(t.Context(), turn.Config{
+		CWD: ".", TurnTimeout: time.Second, IdleTimeout: time.Minute, NoActivityTimeout: noActivity,
+		Prompt:     "hi",
+		PollPeriod: 5 * time.Millisecond,
+	})
+
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, time.Since(start), activeWindow)
+	require.Len(t, output.FinalCalls(), 1)
+	result := output.FinalCalls()[0].Result
+	assert.False(t, result.IsError)
+	assert.NotEqual(t, "fya_no_activity_timeout", result.TerminalReason)
+}
+
+func TestRunnerNoActivityTimeoutDefersToSessionExitDrain(t *testing.T) {
+	output := &mocks.OutputMock{
+		TextFunc:  func(string) error { return nil },
+		FinalFunc: func(stream.Result) error { return nil },
+	}
+	done := make(chan struct{})
+	calls := 0
+	runner := turn.NewRunner(turn.Dependencies{
+		ProcessStarter: &mocks.ProcessStarterMock{StartFunc: func(context.Context, ptyrun.Config) (turn.Session, error) {
+			return newSessionMockWithDone(done), nil
+		}},
+		Readiness: &mocks.ReadinessMock{WaitFunc: func(context.Context, ready.Source) (ready.Result, error) {
+			return ready.Result{Ready: true}, nil
+		}},
+		Injector: &mocks.InjectorMock{TypeFunc: func(context.Context, io.Writer, string) error { return nil }},
+		Catalog: &mocks.CatalogMock{SelectFunc: func(string, time.Time, string) (string, error) {
+			return "x.jsonl", nil
+		}},
+		TailerFactory: func(string) turn.Tailer {
+			return &mocks.TailerMock{ReadNewFunc: func() ([]transcript.Event, bool, error) {
+				calls++
+				if calls == 1 {
+					// claude exits on this read with a result still pending; the no-activity window has elapsed
+					close(done)
+					return []transcript.Event{{ToolUseIDs: []string{"t1"}, StopReason: "tool_use", SessionID: "s2"}}, true, nil
+				}
+				// the post-exit drain surfaces the buffered terminal result
+				return []transcript.Event{{Result: true, SessionID: "s2"}}, true, nil
+			}}
+		},
+		Output: output,
+	})
+
+	err := runner.Run(t.Context(), turn.Config{
+		CWD: ".", TurnTimeout: time.Minute, IdleTimeout: time.Minute, NoActivityTimeout: time.Nanosecond,
+		Prompt:     "hi",
+		PollPeriod: 5 * time.Millisecond,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, output.FinalCalls(), 1)
+	result := output.FinalCalls()[0].Result
+	assert.False(t, result.IsError)
+	assert.NotEqual(t, "fya_no_activity_timeout", result.TerminalReason)
+}
+
+func TestRunnerNoActivityTimeoutSkipsCompletableTurn(t *testing.T) {
+	output := &mocks.OutputMock{
+		TextFunc:  func(string) error { return nil },
+		FinalFunc: func(stream.Result) error { return nil },
+	}
+	calls := 0
+	runner := turn.NewRunner(turn.Dependencies{
+		ProcessStarter: &mocks.ProcessStarterMock{StartFunc: func(context.Context, ptyrun.Config) (turn.Session, error) {
+			return newSessionMock(), nil
+		}},
+		Readiness: &mocks.ReadinessMock{WaitFunc: func(context.Context, ready.Source) (ready.Result, error) {
+			return ready.Result{Ready: true}, nil
+		}},
+		Injector: &mocks.InjectorMock{TypeFunc: func(context.Context, io.Writer, string) error { return nil }},
+		Catalog: &mocks.CatalogMock{SelectFunc: func(string, time.Time, string) (string, error) {
+			return "x.jsonl", nil
+		}},
+		TailerFactory: func(string) turn.Tailer {
+			return &mocks.TailerMock{ReadNewFunc: func() ([]transcript.Event, bool, error) {
+				calls++
+				if calls == 1 {
+					return []transcript.Event{{Text: "answer", SessionID: "s2"}}, true, nil
+				}
+				return nil, false, nil
+			}}
+		},
+		Output: output,
+	})
+
+	// idle-timeout deliberately exceeds the no-activity window: a completable turn
+	// must still finish via idle, not be aborted as a no-activity stall
+	err := runner.Run(t.Context(), turn.Config{
+		CWD: ".", TurnTimeout: time.Second, IdleTimeout: 30 * time.Millisecond, NoActivityTimeout: 10 * time.Millisecond,
+		Prompt:     "hi",
+		PollPeriod: 5 * time.Millisecond,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, output.FinalCalls(), 1)
+	result := output.FinalCalls()[0].Result
+	assert.False(t, result.IsError)
+	assert.NotEqual(t, "fya_no_activity_timeout", result.TerminalReason)
+	assert.Equal(t, "s2", result.SessionID)
+}
+
+func TestRunnerNoActivityTimeoutMeasuredFromStreamStart(t *testing.T) {
+	output := &mocks.OutputMock{
+		TextFunc:  func(string) error { return nil },
+		FinalFunc: func(stream.Result) error { return nil },
+	}
+	calls := 0
+	runner := turn.NewRunner(turn.Dependencies{
+		ProcessStarter: &mocks.ProcessStarterMock{StartFunc: func(context.Context, ptyrun.Config) (turn.Session, error) {
+			return newSessionMock(), nil
+		}},
+		Readiness: &mocks.ReadinessMock{WaitFunc: func(context.Context, ready.Source) (ready.Result, error) {
+			return ready.Result{Ready: true}, nil
+		}},
+		Injector: &mocks.InjectorMock{TypeFunc: func(context.Context, io.Writer, string) error { return nil }},
+		Catalog: &mocks.CatalogMock{SelectFunc: func(string, time.Time, string) (string, error) {
+			return "x.jsonl", nil
+		}},
+		TailerFactory: func(string) turn.Tailer {
+			return &mocks.TailerMock{ReadNewFunc: func() ([]transcript.Event, bool, error) {
+				calls++
+				if calls == 1 {
+					// no activity on the first read: pins that the no-activity clock starts at
+					// streaming entry, not at StartedAt
+					return nil, false, nil
+				}
+				return []transcript.Event{{Result: true, SessionID: "s2"}}, true, nil
+			}}
+		},
+		Output: output,
+	})
+
+	err := runner.Run(t.Context(), turn.Config{
+		CWD: ".", StartedAt: time.Now().Add(-time.Hour),
+		TurnTimeout: time.Hour, IdleTimeout: time.Minute, NoActivityTimeout: time.Minute,
+		Prompt:     "hi",
+		PollPeriod: 5 * time.Millisecond,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, output.FinalCalls(), 1)
+	result := output.FinalCalls()[0].Result
+	assert.False(t, result.IsError)
+	assert.NotEqual(t, "fya_no_activity_timeout", result.TerminalReason)
+}
+
+func TestRunnerNoActivityTimeoutFiresWhenIdleDisabled(t *testing.T) {
+	output := &mocks.OutputMock{
+		TextFunc:  func(string) error { return nil },
+		FinalFunc: func(stream.Result) error { return nil },
+	}
+	calls := 0
+	runner := turn.NewRunner(turn.Dependencies{
+		ProcessStarter: &mocks.ProcessStarterMock{StartFunc: func(context.Context, ptyrun.Config) (turn.Session, error) {
+			return newSessionMock(), nil
+		}},
+		Readiness: &mocks.ReadinessMock{WaitFunc: func(context.Context, ready.Source) (ready.Result, error) {
+			return ready.Result{Ready: true}, nil
+		}},
+		Injector: &mocks.InjectorMock{TypeFunc: func(context.Context, io.Writer, string) error { return nil }},
+		Catalog: &mocks.CatalogMock{SelectFunc: func(string, time.Time, string) (string, error) {
+			return "x.jsonl", nil
+		}},
+		TailerFactory: func(string) turn.Tailer {
+			return &mocks.TailerMock{ReadNewFunc: func() ([]transcript.Event, bool, error) {
+				calls++
+				if calls == 1 {
+					// completion-eligible assistant text, then a hang
+					return []transcript.Event{{Text: "answer", SessionID: "s2"}}, true, nil
+				}
+				return nil, false, nil
+			}}
+		},
+		Output: output,
+	})
+
+	// idle completion disabled (--idle-timeout=0): an eligible-but-hung turn can
+	// never idle-complete, so the no-activity stall must still catch it
+	err := runner.Run(t.Context(), turn.Config{
+		CWD: ".", TurnTimeout: 500 * time.Millisecond, IdleTimeout: 0, NoActivityTimeout: 20 * time.Millisecond,
+		Prompt:     "hi",
+		PollPeriod: 5 * time.Millisecond,
+	})
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, turn.ErrNoActivityTimeout)
+	require.Len(t, output.FinalCalls(), 1)
+	result := output.FinalCalls()[0].Result
+	assert.True(t, result.IsError)
+	assert.Equal(t, "fya_no_activity_timeout", result.TerminalReason)
+}
+
+func TestRunnerNoActivityTimeoutYieldsToContextCancel(t *testing.T) {
+	output := &mocks.OutputMock{
+		TextFunc:  func(string) error { return nil },
+		FinalFunc: func(stream.Result) error { return nil },
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	calls := 0
+	runner := turn.NewRunner(turn.Dependencies{
+		ProcessStarter: &mocks.ProcessStarterMock{StartFunc: func(context.Context, ptyrun.Config) (turn.Session, error) {
+			return newSessionMock(), nil
+		}},
+		Readiness: &mocks.ReadinessMock{WaitFunc: func(context.Context, ready.Source) (ready.Result, error) {
+			return ready.Result{Ready: true}, nil
+		}},
+		Injector: &mocks.InjectorMock{TypeFunc: func(context.Context, io.Writer, string) error { return nil }},
+		Catalog: &mocks.CatalogMock{SelectFunc: func(string, time.Time, string) (string, error) {
+			return "x.jsonl", nil
+		}},
+		TailerFactory: func(string) turn.Tailer {
+			return &mocks.TailerMock{ReadNewFunc: func() ([]transcript.Event, bool, error) {
+				calls++
+				if calls == 1 {
+					// the context is canceled as the no-activity window elapses; cancellation must win
+					cancel()
+					return []transcript.Event{{ToolUseIDs: []string{"t1"}, StopReason: "tool_use", SessionID: "s2"}}, true, nil
+				}
+				return nil, false, nil
+			}}
+		},
+		Output: output,
+	})
+
+	err := runner.Run(ctx, turn.Config{
+		CWD: ".", TurnTimeout: time.Minute, IdleTimeout: time.Minute, NoActivityTimeout: time.Nanosecond,
+		Prompt:     "hi",
+		PollPeriod: 5 * time.Millisecond,
+	})
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, turn.ErrNoActivityTimeout)
+	require.Len(t, output.FinalCalls(), 1)
+	assert.NotEqual(t, "fya_no_activity_timeout", output.FinalCalls()[0].Result.TerminalReason)
+}
+
 func newSessionMock() *mocks.SessionMock {
 	return newSessionMockWithDone(make(chan struct{}))
 }
