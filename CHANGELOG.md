@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.2 - 2026-06-06
+
+### Bug Fixes
+
+- Trim dangling final colons from stream-json assistant output lines while preserving embedded colons such as `key: value`.
+
 ## v0.3.1 - 2026-06-04
 
 ### Bug Fixes
