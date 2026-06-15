@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.3 - 2026-06-14
+
+### Bug Fixes
+
+- Use bracketed paste for all multi-line prompts, including short prompts under the paste-mode word threshold.
+
 ## v0.3.2 - 2026-06-06
 
 ### Bug Fixes
