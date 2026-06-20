@@ -26,6 +26,17 @@ const (
 	// fragmenting one multi-line prompt into many message submissions.
 	bracketedPasteStart = "\x1b[200~"
 	bracketedPasteEnd   = "\x1b[201~"
+	// maxPasteChunk bounds a single write into the PTY master. A large prompt
+	// written in one shot can exceed the slave's line-discipline input buffer;
+	// that write blocks until the slave drains it and — before Claude's TUI has
+	// switched the slave out of canonical mode — never returns, hanging the
+	// turn. Writing the bracketed body in chunks no larger than this keeps every
+	// write inside the buffer. Bytes arrive in order, so splitting a paste marker
+	// across chunks is harmless: the TUI reassembles from its input stream.
+	maxPasteChunk = 1024
+	// pasteChunkDelay gives the slave a moment to drain each chunk before the
+	// next write, so a slow reader never lets the buffer back up.
+	pasteChunkDelay = 5 * time.Millisecond
 )
 
 // SleepFunc waits for d or until ctx is canceled; the real implementation uses
@@ -135,18 +146,31 @@ func (i *Injector) pasteMode(prompt string) bool {
 		(i.cfg.MaxWPMSize > 0 && len(strings.Fields(prompt)) > i.cfg.MaxWPMSize)
 }
 
-// paste writes the whole prompt in a single write without per-rune pacing,
-// mirroring a terminal clipboard paste. The prompt — embedded LF newlines and
-// all — is wrapped in bracketed-paste markers so the TUI buffers it as one
-// literal block and never treats an embedded newline as a submit; a separate
+// paste writes the whole prompt without per-rune pacing, mirroring a terminal
+// clipboard paste. The body is written in chunks no larger than maxPasteChunk
+// so a large prompt never blocks on the PTY input buffer (see that const). The
+// prompt — embedded LF newlines and all — is wrapped in bracketed-paste markers
+// so the TUI buffers it as one literal block and never treats an embedded
+// newline as a submit; a separate
 // carriage return after a settle delay submits the assembled message. The
 // typing-duration estimate and warning are skipped because pasting is
 // effectively instant. The prompt is expected to carry only LF newlines;
 // callers via the CLI get this from input's newline normalization.
 func (i *Injector) paste(ctx context.Context, w io.Writer, prompt string) error {
 	body := bracketedPasteStart + prompt + bracketedPasteEnd
-	if _, err := io.WriteString(w, body); err != nil {
-		return fmt.Errorf("paste prompt: %w", err)
+	for off := 0; off < len(body); off += maxPasteChunk {
+		end := off + maxPasteChunk
+		if end > len(body) {
+			end = len(body)
+		}
+		if _, err := io.WriteString(w, body[off:end]); err != nil {
+			return fmt.Errorf("paste prompt: %w", err)
+		}
+		if end < len(body) {
+			if err := i.cfg.Sleeper(ctx, pasteChunkDelay); err != nil {
+				return fmt.Errorf("paste chunk delay: %w", err)
+			}
+		}
 	}
 	if err := i.cfg.Sleeper(ctx, i.cfg.SettleDelay); err != nil {
 		return fmt.Errorf("settle delay: %w", err)

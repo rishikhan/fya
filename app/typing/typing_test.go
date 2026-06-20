@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,6 +125,24 @@ func TestTypePasteSkipsTurnTimeoutGuard(t *testing.T) {
 		Type(t.Context(), &out, "a long prompt that would exceed any tiny typing budget")
 
 	require.NoError(t, err, "paste mode must not hit the estimated-typing-duration turn-timeout guard")
+}
+
+func TestTypePasteChunksLargeBody(t *testing.T) {
+	sleep := &fakeSleeper{}
+	// A real PTY master blocks (and, before claude switches the slave out of
+	// canonical mode, never returns) when a single write exceeds the line
+	// discipline's input buffer. cappedWriter models that as an error so the
+	// hang is a deterministic failure: the old one-shot paste write of a ~16 KB
+	// body trips it; chunked writes never do.
+	w := &cappedWriter{cap: 4096}
+	prompt := strings.Repeat("x", 16000)
+
+	err := NewInjector(Config{ForcePaste: true, SettleDelay: time.Millisecond, Sleeper: sleep.sleep}).
+		Type(t.Context(), w, prompt)
+
+	require.NoError(t, err, "a large paste must be split into writes no bigger than the pty buffer")
+	assert.Equal(t, bracketedPasteStart+prompt+bracketedPasteEnd+submitEnter, w.buf.String(),
+		"the whole bracketed body plus submit arrives intact, just split across writes")
 }
 
 func TestTypePasteWriteError(t *testing.T) {
@@ -274,6 +294,21 @@ func (j *sequenceJitter) next() float64 {
 	value := j.values[j.idx]
 	j.idx++
 	return value
+}
+
+// cappedWriter accepts writes no larger than cap bytes and errors on anything
+// bigger, standing in for a PTY master whose input buffer a single oversized
+// write would block on. Accepted writes accumulate in buf.
+type cappedWriter struct {
+	cap int
+	buf bytes.Buffer
+}
+
+func (w *cappedWriter) Write(p []byte) (int, error) {
+	if len(p) > w.cap {
+		return 0, fmt.Errorf("write of %d bytes exceeds pty buffer cap %d", len(p), w.cap)
+	}
+	return w.buf.Write(p)
 }
 
 type errWriter struct {
