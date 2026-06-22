@@ -65,7 +65,7 @@ func (r *Reader) readText() (string, error) {
 	prompt := strings.Join(r.req.Args, " ")
 	if strings.TrimSpace(prompt) != "" {
 		// Positional prompts are finite and must not wait on an attached but open stdin pipe.
-		return r.finalize(prompt), nil
+		return r.finalize(prompt)
 	}
 	if r.req.StdinHasData {
 		data, err := io.ReadAll(r.req.Stdin)
@@ -79,7 +79,7 @@ func (r *Reader) readText() (string, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", ErrEmptyPrompt
 	}
-	return r.finalize(prompt), nil
+	return r.finalize(prompt)
 }
 
 func (r *Reader) readStreamJSON() (string, error) {
@@ -94,6 +94,12 @@ func (r *Reader) readStreamJSON() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Finalize and validate before replaying: a prompt that strips to empty must be
+	// rejected without first emitting its raw line to stdout.
+	prompt, err := r.finalize(userPrompt)
+	if err != nil {
+		return "", err
+	}
 	if r.req.ReplayUserMessages {
 		if r.req.Stdout == nil {
 			return "", errors.New("replay user messages requires stdout")
@@ -102,15 +108,21 @@ func (r *Reader) readStreamJSON() (string, error) {
 			return "", fmt.Errorf("replay user message: %w", err)
 		}
 	}
-	return r.finalize(userPrompt), nil
+	return prompt, nil
 }
 
 // finalize normalizes newlines then strips control characters Claude's TUI
 // cannot accept as literal text, warning once when any are dropped. Running it at
 // the single input boundary keeps the injected prompt identical to the one later
-// matched against the transcript.
-func (r *Reader) finalize(prompt string) string {
+// matched against the transcript. It returns ErrEmptyPrompt when stripping leaves
+// nothing deliverable: the upstream guards run on the raw prompt with TrimSpace,
+// which treats ESC/BEL/NUL/DEL as non-space, so a control-only prompt would
+// otherwise slip through to an empty submit and wedge the turn.
+func (r *Reader) finalize(prompt string) (string, error) {
 	cleaned, total, distinct := stripUndeliverable(promptNormalizer.Replace(prompt))
+	if strings.TrimSpace(cleaned) == "" {
+		return "", ErrEmptyPrompt
+	}
 	if total > 0 && r.req.Warn != nil {
 		codes := make([]string, len(distinct))
 		for i, c := range distinct {
@@ -119,7 +131,7 @@ func (r *Reader) finalize(prompt string) string {
 		fmt.Fprintf(r.req.Warn, "warning: removed %d undeliverable control character(s) from prompt: %s\n",
 			total, strings.Join(codes, " "))
 	}
-	return cleaned
+	return cleaned, nil
 }
 
 // isUndeliverable reports whether r is a control character Claude's interactive
